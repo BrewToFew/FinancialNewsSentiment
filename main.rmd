@@ -1,0 +1,336 @@
+---
+title: "Sentiment Analysis of Financial News"
+output: github_document
+---
+
+Instructies:
+
+1. Download deze dataset van Kaggle: https://www.kaggle.com/datasets/miguelaenlle/massive-stock-news-analysis-db-for-nlpbacktests?select=raw_partner_headlines.csv
+
+2. Download de tabel raw_partner_headlines.csv (of download alle tabellen en bewaar alleen raw_partner_headlines.csv)
+
+3. Pak de tabel uit, zodat het geen .zip maar een .csv bestand is
+
+4. Zet de tabel in dezelfde map als dit bestand (main.rmd)
+
+5. Open main.rmd in RStudio en klik op Run > Run All
+
+## Packages
+
+De volgende packages worden gebruikt in dit script:
+
+* ggplot2: kan data visualiseren in grafieken
+
+* dplyr: kan data bewerken op een toegankelijke manier dan dat standaard vanuit R kan
+
+* tidytext: zitten functies in voor sentimentanalyse
+
+* textdata: zitten woordenboeken in die nodig zijn voor sentimentanalyse
+
+```{r echo = F}
+# Installeren van de packages. Dit hoeft maar eenmalig als je RStudio opent. Je hoeft dit dus niet te doen elke keer als je de code draait.
+
+# install.packages('dplyr')
+# install.packages('ggplot2')
+# install.packages('tidytext')
+# install.packages('textdata')
+```
+
+
+```{r message = F, warnings = F}
+library(dplyr)
+library(ggplot2)
+library(tidytext)
+library(textdata)
+```
+
+## Data importeren
+
+We lezen hier het bestand van Kaggle in zodat we het kunnen verwerken. Hieronder zie je de datatypes van de kolommen. Alle kolommen zijn tekst, inclusief het veld waar de datum in staat. Dat gaan we later aanpassen. 
+
+```{r}
+headlines <- read.csv('raw_partner_headlines.csv')
+str(headlines)
+```
+
+Dit zijn de eerste paar regels van de headlines tabel.
+
+```{r}
+head(headlines)
+```
+
+We gaan nu de datums goed zetten. Kolom date heeft de vorm YYYY-MM-DD. De uren / minuten laten we voor wat het is, die hebben we niet nodig. Van de identifier ('X') maken we een character ipv cijfer.
+
+```{r}
+headlines$date <- as.Date(headlines$date, format = "%Y-%m-%d")
+headlines$X <- as.character(headlines$X)
+head(headlines)
+```
+
+## Sentiment analyseren
+
+Er zijn verschillende methodes om sentiment uit een tekst te halen. Dit is een voorbeeld van een goede implementatie: https://www.tidytextmining.com/sentiment.html. Vaak worden tekstverwerkingstappen aan het begin toegepast (bijv. woorden terugbrengen tot de stam, cijfers en symbolen verwijderen, enz.). Soms kan dat je model meer accuraat maken, voor nu slaan we dat even over.
+
+De methodes die we gebruiken voor sentimentanalyse zijn gebaseerd op een woordenboek dat specifieke waardes toekent aan elk woord. Hieronder zie je een voorbeeld voor de methode AFINN. 'abandon' krijgt een waarde van -2, 'abhorrent' een waarde van -3. Als alleen het woord 'abhorrent' in een headline staat, zal die headline dus een score van -3 krijgen. Als een woord niet gevonden kan worden in het woordenboek, wordt het woord genegeerd en heeft het geen impact op de score.
+
+```{r}
+get_sentiments("afinn")
+```
+We gaat de tekst 'tokenizen'. De zin 'ik ga naar huis' wordt dan 'ik', 'ga', 'naar', 'huis'. Eerst halen we zo alle losse woorden eruit, daarna houden we elk woord tegen het woordenboek om te zien welk sentiment erbij hoort. Het resultaat zie je hieronder. Veel woorden komen niet in het woordenboek voor, en krijgen daarom 'NA' als waarde. Op zich is dat logisch - zelfstandige naamwoorden zoals 'million' of 'company' horen geen sentiment te hebben.
+
+```{r}
+tokenized <- headlines %>% unnest_tokens(word, headline)
+afinn <- get_sentiments("afinn")
+tokenized <- tokenized %>% left_join(afinn, by = "word") 
+head(tokenized)
+```
+
+We kunnen de scores nu optellen per artikel. Elke keer als er 'NA' staat negeren we dat, zodat 'NA' als 0 meetelt en geen invloed heeft op het sentiment. We voegen de scores dan toe aan de originele artikelen.
+
+```{r}
+scores <- tokenized %>% group_by(X) %>%
+  summarize(sentiment_score = sum(value, na.rm = T))
+
+headlines <- headlines %>% left_join(scores, by = "X")
+```
+
+Nu we de sentimentscores hebben kunnen we checken of we ze logisch vinden. Dit zijn de headlines met de laagste sentimentscores. Wat opvalt is dat het bovenste artikel drie keer voorkomt, omdat er drie verschillende stocks in besproken worden. Dat is niet wat we willen, elk artikel zou maximaal één keer mogen voorkomen. Dit zou je kunnen onderzoeken om te zien hoeveel dubbele artikelen in de data zitten, ik laat het voor nu wat het is.
+
+```{r}
+headlines %>% arrange(sentiment_score) %>% head(n = 10)
+```
+
+Dit zijn de headlines met het meest positieve sentiment.
+
+```{r}
+headlines %>% arrange(desc(sentiment_score)) %>% head(n = 10)
+```
+
+We kunnen het testen van hierboven verder doortrekken door het sentiment te berekenen per bedrijf. Om te voorkomen dat één artikel het hele sentiment bepaalt, voegen we ook het aantal artikelen per bedrijf toe.
+
+```{r}
+company <- headlines %>% group_by(stock) %>% summarize(n_articles = n(),
+                                            avg_sentiment = mean(sentiment_score))
+head(company)
+```
+
+Vervolgens pakken we alleen de bedrijven waar minstens 30 artikelen over zijn geschreven en die het laagste sentiment hebben. De bedrijven met de slechtste sentimenten zijn 'MCZ', 'GHI' en 'FHK'.
+
+```{r}
+company %>% filter(n_articles >= 30) %>% arrange(avg_sentiment) %>% head()
+```
+
+Nu gaan we kijken naar de headlines die deze bedrijven hebben. Bij 'MCZ' valt het op dat ook neutrale headlines een negative score hebben. De naam van het bedrijf is 'Mad Catz' en dat verklaart waarom - 'Mad' zal in het woordenboek een negatieve score hebben, waardoor elke headline waarin het bedrijf genoemd is (onterecht) negatief is. Eigenlijk zouden bedrijfsnamen uit de headlines gefilterd moeten worden, aangezien die geen onderdeel zijn van het sentiment. Voor nu is dat te moeilijk.
+
+```{r}
+headlines %>% filter(stock == 'MCZ') %>% head()
+```
+
+Bij GHI komen de negatieve headlines door iets anders, GHI staat voor Global Health Intelligence en is een research agency dat artikelen schrijft over emerging markets. FHK staat voor First Trust Hong Kong en is een investment fund dat wordt aangehaald in artikelen over een mogelijke handelsoorlog tussen VS en China. De headlines zijn hier correct geïnterpreteerd.
+
+```{r}
+headlines %>% filter(stock == 'GHI') %>% head()
+headlines %>% filter(stock == 'FHK') %>% head()
+```
+
+De volgende stap is het berekenen van sentiment over tijd. We pakken de headlines, groeperen ze op datum en pakken het gemiddelde. In de resultaten zit een artikel uit 1969 - dit zal een fout zijn, dus die filteren we eruit. Net zoals bij de bedrijven stellen we een minimum aan het aantal artikelen per dag, zodat de resultaten niet vertekend zijn door maar een paar artikelen. (Ik gok dat de dagen waarop weinig artikelen gepubliceerd worden, vooral zaterdagen en zondagen zijn. Die zou je er ook systematisch uit kunnen filteren.)
+
+Resultaten kunnen we plotten in grafiek. Er zit een trend lijn in met confidence interval van 95% (dat is het lichtgrijze gebied rond de lijn). De grafiek start negatief in 2010 (Europese schuldencrisis?), heeft een dip in 2016 (?) en begin 2019 (corona?).
+
+```{r warnings = F}
+headlines %>% group_by(date) %>% 
+  summarize(n_articles = n(), avg_sentiment = mean(sentiment_score)) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = avg_sentiment)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y")
+```
+
+Er zijn meerdere manieren om de methodologie sterker te maken:
+
+1. Het is mogelijk indicatoren op te zoeken van investor sentiment en die aan de grafiek toe te voegen. Dat kan ons meer vertrouwen geven of de cijfers overeen komen met wat we zouden verwachten.
+
+2. Het is mogelijk om andere meetmethodes toe te voegen voor sentiment en te kijken of die overeen komen met hierboven.
+
+3. Het is mogelijk om andere datasets te gebruiken om te zien of onze dataset representatief is voor financieel nieuws.
+
+Van deze opties is 2 het makkelijkst. Hierboven heb ik sentimenten van de methode AFINN gebruikt, maar er bestaan nog meer woordenlijsten met sentimentwaardes. Ik gebruik ook de lijsten Bing, Loughran en Nrc. Ik weet niet de inhoudelijke argumenten om een bepaalde methode te kiezen, daarvoor kun je het beste zelf zoeken.
+
+## Alternatieve sentimenten toevoegen
+
+```{r}
+headlines <- headlines %>% rename(score_afinn = sentiment_score)
+
+bing <- get_sentiments("bing")
+nrc <- get_sentiments("nrc")
+loughran <- get_sentiments("loughran")
+```
+
+```{r}
+tokenized <- headlines %>% unnest_tokens(word, headline)
+tokenized <- tokenized %>% left_join(bing, by = "word") %>% rename(score_bing = sentiment)
+tokenized <- tokenized %>% left_join(nrc, by = "word") %>% rename(score_nrc = sentiment)
+tokenized <- tokenized %>% left_join(loughran, by = "word") %>% rename(score_loughran = sentiment)
+head(tokenized)
+```
+
+Deze nieuwe scores werken anders. In plaats van cijfers kennen ze categorieën toe. Daar moeten we eerst cijfers van maken. Voor bing gaat dat het makkelijkst, daar is de classificering positive of negative.
+
+```{r}
+tokenized %>% group_by(score_bing) %>% count()
+```
+
+Positive veranderen we in 1, negative in -1.
+
+```{r}
+tokenized <- tokenized %>% mutate(score_bing = case_when(score_bing == "positive" ~ 1,
+                                                         score_bing == "negative" ~ -1))
+```
+
+Bij nrc is het lastiger, daar hebben we meer categorieën. Voor nu kies ik voor de makkelijkste oplossing: positive krijgt een 1, negative een -1, rest wordt genegeerd.
+
+```{r}
+tokenized %>% group_by(score_nrc) %>% count()
+```
+
+```{r}
+tokenized <- tokenized %>% mutate(score_nrc = case_when(score_nrc == "positive" ~ 1,
+                                                        score_nrc == "negative" ~ -1))
+```
+
+Als laatste is nog loughran over. Ook hier zitten meer categorieën in die we voor nu negeren, we pakken alleen positive en negative.
+
+```{r}
+tokenized %>% group_by(score_loughran) %>% count()
+```
+
+```{r}
+tokenized <- tokenized %>% mutate(score_loughran = case_when(score_loughran == "positive" ~ 1,
+                                                             score_loughran == "negative" ~ -1))
+```
+
+Nu we alle scores hebben omgezet naar cijfers, kunnen we ze bij elkaar optellen om te zien wat de score per artikel is. We kunnen ze dan weer samenvoegen met headlines.
+
+```{r}
+scores <- tokenized %>% group_by(X) %>%
+  summarize(score_bing = sum(score_bing, na.rm = T),
+            score_nrc = sum(score_nrc, na.rm = T),
+            score_loughran = sum(score_loughran, na.rm = T))
+
+head(scores)
+headlines <- headlines %>% left_join(scores, by = "X")
+```
+
+Het is mogelijk om ook dieper in de scores van de andere methodes te duiken - wat zijn de meest positieve en negatieve dingen, kunnen de andere groepen die we hierboven uit de data hebben gelaten ook mee, enz. Ik laat die discussie voor wat het is en ga door met visualiseren.
+
+```{r}
+graph_data <- headlines %>% group_by(date) %>% summarize(n_articles = n(),
+                                           score_afinn = mean(score_afinn),
+                                           score_bing = mean(score_bing),
+                                           score_nrc = mean(score_nrc),
+                                           score_loughran = mean(score_loughran))
+graph_data <- graph_data %>% filter(date != as.Date("1969-12-31"), n_articles >= 15)
+head(graph_data)
+```
+
+
+```{r warnings = F}
+graph_data %>% ggplot(aes(x = date, y = score_afinn)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + ggtitle('Financial news sentiment using AFINN')
+graph_data %>% ggplot(aes(x = date, y = score_nrc)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + ggtitle('Financial news sentiment using NRC')
+graph_data %>% ggplot(aes(x = date, y = score_bing)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + ggtitle('Financial news sentiment using Bing')
+graph_data %>% ggplot(aes(x = date, y = score_loughran)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + ggtitle('Financial news sentiment using Loughran')
+```
+
+## Sentiment zonder nulwaardes
+
+Bij Bing en Loughran valt het op dat de serie erg dicht bij nul zit. Dit komt mogelijk omdat veel headlines geen woorden hebben die in het woordenboek staan, waardoor ze nul als score krijgen en zwaar naar nul als gemiddelde trekken.
+
+Het probleem hier is hoe we moeten omgaan met missing values. Tot nu toe zijn we ervan uitgegaan dat een headline zonder woorden in de dictionary neutraal is, en daarom het label 0 krijgt. Een mogelijk alternatief is om de artikelen met score 0 weg te laten, omdat je niet met zekerheid kan zeggen dat je ze neutraal kan classificeren. Hieronder is dat geïmplementeerd. We pakken hier dus alleen de headlines met positief of negatief sentiment, en laten de rest weg. 
+
+```{r}
+graph_data <- headlines %>% filter(score_afinn != 0) %>% 
+  group_by(date) %>% summarize(n_articles = n(), score_afinn = mean(score_afinn))
+graph_data <- graph_data %>% filter(date != as.Date("1969-12-31"), n_articles >= 15)
+
+graph_data %>% ggplot(aes(x = date, y = score_afinn)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + ggtitle('Financial news sentiment using AFINN')
+
+graph_data <- headlines %>% filter(score_nrc != 0) %>% 
+  group_by(date) %>% summarize(n_articles = n(), score_nrc = mean(score_nrc))
+graph_data <- graph_data %>% filter(date != as.Date("1969-12-31"), n_articles >= 15)
+
+graph_data %>% ggplot(aes(x = date, y = score_nrc)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + ggtitle('Financial news sentiment using NRC')
+
+graph_data <- headlines %>% filter(score_bing != 0) %>% 
+  group_by(date) %>% summarize(n_articles = n(), score_bing = mean(score_bing))
+graph_data <- graph_data %>% filter(date != as.Date("1969-12-31"), n_articles >= 15)
+
+graph_data %>% ggplot(aes(x = date, y = score_bing)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + ggtitle('Financial news sentiment using Bing')
+
+graph_data <- headlines %>% filter(score_loughran != 0) %>% 
+  group_by(date) %>% summarize(n_articles = n(), score_loughran = mean(score_loughran))
+graph_data <- graph_data %>% filter(date != as.Date("1969-12-31"), n_articles >= 15)
+
+graph_data %>% ggplot(aes(x = date, y = score_loughran)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + ggtitle('Financial news sentiment using Loughran')
+```
+
+Bovenstaande grafieken zien er beter uit. Je ziet wel dat de metrics erg verschillen. Bij AFINN is de standard error bijv. stuk groter dan bij NRC. Dat heeft met de manier van meten te maken, bij AFINN kan een enkel woord in een artikel al een score van 4 veroorzaken, terwijl dat bij NRC maximaal 1 is. Je kan hier verder op experimenteren door de variabelen vergelijkbaar te schalen. Maar op zich kan je dit al prima gebruiken als dependent variable voor je regressie. Persoonlijk zou ik alle vier de modellen testen, achterliggende redenen zoeken (wat maakt deze methodes anders, hoe steken ze in elkaar) en kijken welk model de beste fit oplevert met de data.
+
+Als de variance te groot is om fatsoenlijk te kunnen gebruiken in een regressie, zou je ook gemiddeldes kunnen pakken over langere periodes. Dan gebruik je bijvoorbeeld het wekelijkse gemiddelde sentiment als dependent variable. Eventueel kan je ook de blauwe trendlijn als dependent variabele pakken, maar dat is erg kort door de bocht en statistisch moeilijk te onderbouwen.
+
+## Sentiment gemeten op emoties
+
+Als laatste wil ik nog op een stuk verder doorbouwen: de extra categorieën voor nrc en loughran. Kunnen we daar meer uithalen dan alleen één variabele die laat zien hoe positief of negatief het nieuws is?
+
+Om dat te testen voegen we eerst de oorspronkelijke categorieën opnieuw toe, we noemen ze category_nrc en category_loughran.
+
+```{r}
+tokenized <- tokenized %>% left_join(nrc, by = "word") %>% rename(category_nrc = sentiment)
+tokenized <- tokenized %>% left_join(loughran, by = "word") %>% rename(category_loughran = sentiment)
+```
+
+We berekenen dan het aantal woorden per emotie, artikel en datum. Woorden die niet in een emotie geclassificeerd kunnen worden, worden weer eruit gefilterd.
+
+```{r}
+graph_data_nrc <- tokenized %>% 
+  filter(!is.na(category_nrc)) %>% group_by(date, X, category_nrc) %>% count()
+```
+
+```{r}
+graph_data_nrc <- graph_data_nrc %>% filter(date != as.Date("1969-12-31"),
+                                            !is.na(category_nrc))
+```
+
+Het aantal emoties per dag kan dan in een grafiek geplot worden. Wat opvalt is dat ze allemaal een vergelijkbaar patroon volgen. Dat patroon zal in lijn zijn met het aantal artikelen van de dataset. Om de verschillen duidelijker te maken, is het ook mogelijk om de emoties te plotten als % van alle emoties op één dag. Maar die grafieken blijven redelijk stabiel.
+
+Conclusie: het plotten van de emoties uit NRC lijkt weinig toegevoegde waarde te hebben. Mogelijk is de classificatie te grof, of de data niet representatief genoeg.
+
+```{r warnings = F}
+q <- graph_data_nrc %>% group_by(date, category_nrc) %>% summarize(n = sum(n))
+q <- q %>% 
+  left_join(q %>% group_by(date) %>% summarize(total = sum(n)), by = "date")
+q %>% ggplot(aes(x=date, y=n)) + geom_smooth() + facet_wrap(~category_nrc)
+q %>% ggplot(aes(x=date, y=n / total)) + geom_smooth(se = F) + facet_wrap(~category_nrc)
+```
+
+Als laatste hebben we dan nog Loughran. Dit is een woordenboek dat specifiek is toegesplitst op financiële teksten, omdat het o.a. gebaseerd is op teksten uit earnings calls. Ook hierin zit een vergelijkbaar patroon. 
+
+```{r}
+graph_data_loughran <- tokenized %>% 
+  filter(!is.na(category_loughran)) %>% group_by(date, X, category_loughran) %>% count()
+```
+
+```{r warnings = F}
+r <- graph_data_loughran %>% group_by(date, category_loughran) %>% summarize(n = sum(n))
+
+r %>% ggplot(aes(x=date, y=n)) + geom_smooth(se = F) + facet_wrap(~category_loughran)
+```
+
+
+
