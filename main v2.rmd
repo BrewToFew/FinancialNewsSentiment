@@ -1,0 +1,634 @@
+---
+title: "Sentiment Analysis of Financial News"
+output: github_document
+---
+
+```{r message = F, warnings = F}
+library(dplyr)
+library(ggplot2)
+library(tidytext)
+library(textdata)
+library(sentimentr)
+library(DBI)
+library(caret)
+```
+
+```{r}
+wd_old <- getwd()
+
+# Verwijs naar de map waar je data staat opgeslagen
+wd <- 'D:/Projects/FinancialNewsSentiment'
+```
+
+## Validatie
+
+```{r}
+setwd(wd)
+# https://www.kaggle.com/datasets/ankurzing/sentiment-analysis-for-financial-news
+df_validation <- read.csv('all-data.csv', header = FALSE)
+df_validation <- df_validation %>% rename(true_sentiment = 1, text = 2) %>% mutate(id = row_number()) %>% select(id, text, true_sentiment)
+```
+
+Sentiment achterhalen voor de validatie dataset:
+
+```{r}
+# SentimentR
+t <- get_sentences(df_validation$text)
+t <- sentiment_by(t)
+t <- t %>% rename(score_sentimentr = ave_sentiment) %>% select(-element_id, -word_count, -sd)
+
+# Bing, nrc, loughran
+bing <- get_sentiments("bing")
+nrc <- get_sentiments("nrc")
+loughran <- get_sentiments("loughran")
+
+u <- df_validation %>% unnest_tokens(word, text)
+u <- u %>% left_join(bing, by = "word") %>% rename(score_bing = sentiment)
+u <- u %>% left_join(nrc, by = "word") %>% rename(score_nrc = sentiment)
+u <- u %>% left_join(loughran, by = "word") %>% rename(score_loughran = sentiment)
+
+u <- u %>% mutate(score_bing = case_when(score_bing == "positive" ~ 1,
+                                         score_bing == "negative" ~ -1))
+u <- u %>% mutate(score_nrc = case_when(score_nrc == "positive" ~ 1,
+                                        score_nrc == "negative" ~ -1))
+u <- u %>% mutate(score_loughran = case_when(score_loughran == "positive" ~ 1,
+                                             score_loughran == "negative" ~ -1))
+
+u <- u %>% group_by(id) %>%
+  summarize(score_bing = sum(score_bing, na.rm = T),
+            score_nrc = sum(score_nrc, na.rm = T),
+            score_loughran = sum(score_loughran, na.rm = T))
+
+df_validation <- df_validation %>% bind_cols(t)
+df_validation <- df_validation %>% left_join(u, by = "id")
+rm(bing, loughran, nrc, t, u)
+gc()
+```
+
+Met sentimentR en Bing hebben we ordinale variabelen (hoe positiever de score, hoe groter de waarde). Voordat we hier een categorie van maken, proberen we de scores te visualiseren.
+
+```{r}
+ggplot(df_validation, aes(x = true_sentiment, y = score_sentimentr, col = true_sentiment)) +
+  geom_boxplot() +
+  labs(x = "Actual sentiment", y = "Predicted sentiment score using sentimentR", color = "Actual sentiment")
+```
+
+```{r}
+df_validation %>% filter(true_sentiment != "neutral") %>% 
+  ggplot(aes(x = true_sentiment, y = score_bing, col = true_sentiment)) +
+  geom_boxplot() +
+  labs(x = "Actual sentiment", y = "Predicted sentiment score using Bing", color = "Actual sentiment")
+```
+
+We moeten de ordinale cijfers vertalen naar een classificatie (positief, neutraal, negatief). Hoe kunnen we dat het beste doen? We berekenen daarvoor quantiles op basis van de verdeling negative - neutral - positive die oorspronkelijk in de data zat.
+
+Dit was de oorspronkelijke verdeling voor de validatiedataset:
+
+```{r}
+df_validation %>% group_by(true_sentiment) %>% summarize(count = n()) %>%
+  mutate(percentage = count / sum(count))
+```
+
+Dit worden de cutoffs als we ze daarop toepassen:
+
+```{r}
+# Calculate cutoff values using quantiles
+cutoff_values_sentimentr <- quantile(df_validation$score_sentimentr, probs = c(0.1247, 0.1247 + 0.5941))
+cutoff_values_sentimentr
+```
+
+Oftewel, als de score van sentimentR lager is dan -0.07 classificeren we de zin als negatief, boven 0.194 is positief, en ertussenin is neutraal.
+
+
+
+```{r}
+# Calculate cutoff values using quantiles
+cutoff_values_bing <- quantile(df_validation$score_bing, probs = c(0.1247, 0.1247 + 0.5941))
+cutoff_values_nrc <- quantile(df_validation$score_nrc, probs = c(0.1247, 0.1247 + 0.5941))
+cutoff_values_loughran <- quantile(df_validation$score_loughran, probs = c(0.1247, 0.1247 + 0.5941))
+
+print('Bing:')
+cutoff_values_bing
+print('Nrc:')
+cutoff_values_nrc
+print('Loughran:')
+cutoff_values_loughran
+```
+
+```{r}
+# Make predictions using the scores
+df_validation$pred_sentimentr <- cut(df_validation$score_sentimentr, breaks = c(-Inf, cutoff_values_sentimentr, Inf), labels = c("negative", "neutral", "positive"), include.lowest = TRUE)
+df_validation <- df_validation %>% mutate(pred_bing = ifelse(score_bing < 0, "negative", ifelse(score_bing > 0, "positive", "neutral")))
+df_validation$pred_nrc <- cut(df_validation$score_nrc, breaks = c(-Inf, cutoff_values_nrc, Inf), labels = c("negative", "neutral", "positive"), include.lowest = TRUE)
+df_validation$pred_loughran <- cut(df_validation$score_loughran, breaks = c(-Inf, cutoff_values_loughran, Inf), labels = c("negative", "neutral", "positive"), include.lowest = TRUE)
+```
+
+```{r}
+# Evaluate the predictions
+df_validation$pred_bing <- as.factor(df_validation$pred_bing)
+df_validation$true_sentiment <- as.factor(df_validation$true_sentiment)
+```
+
+Results SentimentR:
+
+```{r}
+confusionMatrix(df_validation$pred_sentimentr, df_validation$true_sentiment)
+```
+
+Results Bing:
+
+```{r}
+confusionMatrix(df_validation$pred_bing, df_validation$true_sentiment)
+```
+
+Results NRC:
+
+```{r}
+confusionMatrix(df_validation$pred_nrc, df_validation$true_sentiment)
+```
+
+Results Loughran:
+
+```{r}
+confusionMatrix(df_validation$pred_loughran, df_validation$true_sentiment)
+```
+
+## Data importeren
+
+1. Kaggle headlines
+
+```{r}
+setwd(wd)
+
+# Import data
+df_kaggle <- read.csv('raw_partner_headlines.csv')
+df_kaggle$source <- 'kaggle'
+
+# Set column types
+df_kaggle$date <- as.Date(df_kaggle$date, format = "%Y-%m-%d")
+df_kaggle$X <- as.character(df_kaggle$X)
+df_kaggle <- df_kaggle %>% rename(text = headline)
+
+# Remove duplicate articles that are linked to multiple companies
+df_kaggle <- df_kaggle %>% group_by(url) %>% filter(n() == 1) %>% ungroup() %>% select(-stock)
+head(df_kaggle)
+```
+
+2. Reuters
+
+```{r}
+setwd(paste(wd, '/reuters/', sep = ''))
+file_list <- list.files(pattern = "\\.tsv$")
+
+data_list <- list()  # Initialize an empty list to store the data frames
+
+for (file in file_list) {
+  filepath <- file  # If the files are in the current working directory
+  # Alternatively, if the files are in a subfolder within the working directory:
+  # filepath <- file.path("subfolder", file)
+  
+  # Read the TSV file and store it in the list
+  data <- read.delim(filepath)
+  data_list[[file]] <- data
+}
+
+# Merge all the data frames into a single data frame
+df_reuters <- bind_rows(data_list)
+
+rm(data_list, file_list, data, file, filepath)
+gc()
+```
+
+```{r}
+df_reuters$date <- as.Date(df_reuters$ts, format = "%Y%m%d")
+df_reuters <- df_reuters %>% rename(text = title, url = href) %>% select(-ts) %>% mutate(source = "reuters")
+df <- bind_rows(df_kaggle, df_reuters)
+df <- df %>% select(-X)
+df <- df %>% mutate(id = row_number(),
+                    score_sentimentr = NA,
+                    score_bing = NA,
+                    score_nrc = NA,
+                    score_loughran = NA,
+                    pred_sentimentr = NA,
+                    pred_bing = NA,
+                    pred_nrc = NA,
+                    pred_loughran = NA)
+```
+
+## Schrijf de data weg naar een database
+
+```{r}
+# setwd(wd)
+# con <- dbConnect(RSQLite::SQLite(),dbname="articles.db")
+# # dbCreateTable(con, "df", head(df))
+# # dbAppendTable(con, "df", head(df))
+# dbWriteTable(con, "df", df, overwrite = TRUE)
+# dbDisconnect(con)
+```
+```{r}
+# show database
+# setwd(wd)
+# con <- dbConnect(RSQLite::SQLite(),dbname="articles.db")
+# db <- tbl(con, "df")
+# db %>% count() %>% collect() %>% pull(n)
+# db %>% head() %>% collect() 
+# dbDisconnect(con)
+```
+
+
+```{r}
+calculate_scores <- function(df_query) {
+  df_query <- df_query %>% select(-score_sentimentr, -score_bing, -score_nrc, -score_loughran, -pred_sentimentr, -pred_bing, -pred_nrc, -pred_loughran)
+  # SentimentR
+  t <- get_sentences(df_query$text)
+  t <- sentiment_by(t)
+  t <- t %>% rename(score_sentimentr = ave_sentiment) %>% select(-element_id, -word_count, -sd)
+  
+  # Bing, nrc, loughran
+  bing <- get_sentiments("bing")
+  nrc <- get_sentiments("nrc")
+  loughran <- get_sentiments("loughran")
+  
+  u <- df_query %>% unnest_tokens(word, text)
+  u <- u %>% left_join(bing, by = "word") %>% rename(score_bing = sentiment)
+  u <- u %>% left_join(nrc, by = "word") %>% rename(score_nrc = sentiment)
+  u <- u %>% left_join(loughran, by = "word") %>% rename(score_loughran = sentiment)
+  
+  u <- u %>% mutate(score_bing = case_when(score_bing == "positive" ~ 1,
+                                           score_bing == "negative" ~ -1))
+  u <- u %>% mutate(score_nrc = case_when(score_nrc == "positive" ~ 1,
+                                          score_nrc == "negative" ~ -1))
+  u <- u %>% mutate(score_loughran = case_when(score_loughran == "positive" ~ 1,
+                                               score_loughran == "negative" ~ -1))
+  
+  u <- u %>% group_by(id) %>%
+    summarize(score_bing = sum(score_bing, na.rm = T),
+              score_nrc = sum(score_nrc, na.rm = T),
+              score_loughran = sum(score_loughran, na.rm = T))
+  
+  df_query <- bind_cols(df_query, t)
+  df_query <- df_query %>% left_join(u, by = "id")
+  
+  # Make predictions using the scores
+  df_query$pred_sentimentr <- cut(df_query$score_sentimentr, breaks = c(-Inf, cutoff_values_sentimentr, Inf), labels = c("negative", "neutral", "positive"),
+                                  include.lowest = TRUE)
+  df_query <- df_query %>% mutate(pred_bing = ifelse(score_bing < 0, "negative", ifelse(score_bing > 0, "positive", "neutral")))
+  df_query$pred_nrc <- cut(df_query$score_nrc, breaks = c(-Inf, cutoff_values_nrc, Inf), labels = c("negative", "neutral", "positive"), include.lowest = TRUE)
+  df_query$pred_loughran <- cut(df_query$score_loughran, breaks = c(-Inf, cutoff_values_loughran, Inf), labels = c("negative", "neutral", "positive"),
+                                include.lowest = TRUE)
+  df_validation$pred_bing <- as.factor(df_validation$pred_bing)
+  df_validation$true_sentiment <- as.factor(df_validation$true_sentiment)
+  return(df_query)
+}
+
+```
+
+```{r}
+# setwd(wd)
+# con <- dbConnect(RSQLite::SQLite(),dbname="articles.db")
+# db <- tbl(con, "df")
+#   
+# start_row = 1
+# bump = 20000
+# end_row = start_row + bump
+# end_row_limit = row_count <- db %>% count() %>% collect() %>% pull(n)
+# dbDisconnect(con)
+# 
+# while (start_row <= end_row_limit) {
+#   setwd(wd)
+#   con <- dbConnect(RSQLite::SQLite(),dbname="articles.db")
+#   db <- tbl(con, "df")
+#   
+#   if(end_row_limit - start_row < bump) {
+#     end_row = end_row_limit
+#   }
+#   print(paste('Reading row id', start_row, 'until', end_row))
+#   df_query <- db %>% filter(id %in% c(start_row:end_row)) %>% collect()
+#   df_query$date <- as.Date(df_query$date, origin = "1970-01-01")
+#   dbDisconnect(con)
+#   
+#   df_query <- calculate_scores(df_query)
+#   
+#   setwd(wd)
+#   con <- dbConnect(RSQLite::SQLite(),dbname="articles.db")
+#   db <- tbl(con, "df")
+#   print(paste('Writing row id', start_row, 'until', end_row))
+#   dbExecute(con, paste("DELETE FROM df WHERE id BETWEEN ", start_row, " AND ", end_row, sep = ""))
+#   dbWriteTable(con, "df", df_query, append = TRUE, row.names = FALSE)
+#   dbDisconnect(con)
+#   
+#   start_row <- start_row + bump
+#   end_row <- end_row + bump
+# }
+
+```
+
+## Sentiment analyseren
+
+1. Analyse met Kaggle dataset
+
+```{r}
+setwd(wd)
+con <- dbConnect(RSQLite::SQLite(),dbname="articles.db")
+db <- tbl(con, "df")
+df_kaggle <- db %>% filter(source == "kaggle") %>% collect()
+df_kaggle$date <- as.Date(df_kaggle$date, origin = "1970-01-01")
+dbDisconnect(con)
+```
+
+Meest negatieve headlines SentimentR:
+
+```{r}
+df_kaggle %>% arrange(score_sentimentr) %>% head(n = 10)
+```
+
+Meest negatieve headlines NRC:
+
+```{r}
+df_kaggle %>% arrange(score_nrc) %>% head(n = 10)
+```
+
+Meest negatieve headlines Bing (hierin weegt duidelijk het woord volatility mee):
+
+```{r}
+df_kaggle %>% arrange(score_bing) %>% head(n = 10)
+```
+
+Meest negatieve headlines Loughran:
+
+```{r}
+df_kaggle %>% arrange(score_loughran) %>% head(n = 10)
+```
+
+Dit zijn de headlines met het meest positieve sentiment. Dit is alleen SentimentR, je kan zelf de code aanpassen als je ook de andere methodes wilt zien.
+
+```{r}
+df_kaggle %>% arrange(desc(score_sentimentr)) %>% head(n = 10)
+```
+
+
+```{r warnings = F}
+df_kaggle %>% group_by(date) %>% 
+  summarize(n_articles = n(), avg_sentiment = mean(score_sentimentr)) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = avg_sentiment)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Average sentiment") +
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using SentimentR')
+```
+
+Je kan de grafiek hierboven wat finetunen door alleen de dagen te pakken waarop veel nieuws was (meer dan vijftig artikelen). Zie de grafiek hieronder:
+
+```{r warnings = F}
+df_kaggle %>% group_by(date) %>% 
+  summarize(n_articles = n(), avg_sentiment = mean(score_sentimentr)) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 50) %>%
+  ggplot(aes(x = date, y = avg_sentiment)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Average sentiment") +
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using SentimentR')
+```
+
+Dan NRC. Dit is een slechte metric volgens de validatieresultaten, dat zie je hier ook terug.
+
+```{r warnings = F}
+df_kaggle %>% group_by(date) %>% 
+  summarize(n_articles = n(), avg_sentiment = mean(score_nrc)) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = avg_sentiment)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Average sentiment") +
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using NRC')
+```
+
+Dan Bing. Hier zit te weinig variatie in, ik zou minstens de outlier wegsnijden.
+
+```{r warnings = F}
+df_kaggle %>% group_by(date) %>% 
+  summarize(n_articles = n(), avg_sentiment = mean(score_bing)) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = avg_sentiment)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Average sentiment") +
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using Bing')
+```
+
+Dan Loughran. Ook niet zo spannend.
+
+```{r warnings = F}
+df_kaggle %>% group_by(date) %>% 
+  summarize(n_articles = n(), avg_sentiment = mean(score_loughran)) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = avg_sentiment)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Average sentiment") +
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using Loughran')
+```
+
+We hebben sentiment gemeten op meerdere manieren. Eerst hebben we per methode de score berekend, maar daarna hebben we het artikel ook geclassificeerd op positief / negatief / neutraal. Laten we eens die classificatie gebruiken om te zien of dat andere grafieken oplevert.
+
+```{r}
+df_kaggle %>% group_by(date, pred_sentimentr) %>%
+  summarize(n_articles = n()) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = n_articles, group = pred_sentimentr, col = pred_sentimentr)) + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Number of articles", color = "Sentiment") + 
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using SentimentR')
+```
+
+Zelfde voor Bing:
+
+```{r}
+df_kaggle %>% group_by(date, pred_bing) %>%
+  summarize(n_articles = n()) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = n_articles, group = pred_bing, col = pred_bing)) + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Number of articles", color = "Sentiment") + 
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using Bing')
+```
+
+Zelfde voor NRC:
+
+```{r}
+df_kaggle %>% group_by(date, pred_nrc) %>%
+  summarize(n_articles = n()) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = n_articles, group = pred_nrc, col = pred_nrc)) + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Number of articles", color = "Sentiment") + 
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using NRC')
+```
+
+Zelfde voor Loughran:
+
+```{r}
+df_kaggle %>% group_by(date, pred_loughran) %>%
+  summarize(n_articles = n()) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = n_articles, group = pred_loughran, col = pred_loughran)) + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Number of articles", color = "Sentiment") + 
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using Loughran')
+```
+
+
+2. Analyse met Reuters dataset
+
+Nu gaan we hetzelfde herhalen met de tweede dataset met Reuters headlines.
+
+```{r}
+rm(df_kaggle)
+
+setwd(wd)
+con <- dbConnect(RSQLite::SQLite(),dbname="articles.db")
+db <- tbl(con, "df")
+df_reuters <- db %>% filter(source == "reuters") %>% collect()
+df_reuters$date <- as.Date(df_reuters$date, origin = "1970-01-01")
+dbDisconnect(con)
+```
+
+Meest negatieve headlines SentimentR:
+
+```{r}
+df_reuters %>% arrange(score_sentimentr) %>% head(n = 10)
+```
+
+Je ziet dat hier herpublicaties in zitten. Zijn wat lastiger te verwijderen, omdat het niet per ID gaat.
+
+We behouden daarom alleen de articles met unieke tekst (je kan erover discussiëren of dat juist is voor duplicates, maar dat laat ik aan jou over). We gaan hiermee van 8,5 miljoen titels naar 6,6 miljoen. 
+
+```{r}
+df_reuters <- df_reuters %>% distinct(text, .keep_all = T)
+```
+
+Meest negatieve headlines SentimentR (nu zonder duplicates):
+
+```{r}
+df_reuters %>% arrange(score_sentimentr) %>% head(n = 10)
+```
+
+Meest negatieve headlines NRC:
+
+Opmerking: met dictionary-based approaches is de kans op een hit groter in langere titels. Moet je daarvoor corrigeren? Daarvoor kan je beide kanten beargumenteren.
+
+```{r}
+df_reuters %>% arrange(score_nrc) %>% head(n = 10)
+```
+
+Meest negatieve headlines Bing:
+
+```{r}
+df_reuters %>% arrange(score_bing) %>% head(n = 10)
+```
+
+Meest negatieve headlines Loughran:
+
+```{r}
+df_reuters %>% arrange(score_loughran) %>% head(n = 10)
+```
+
+Dit zijn de headlines met het meest positieve sentiment. Dit is alleen SentimentR, je kan zelf de code aanpassen als je ook de andere methodes wilt zien.
+
+```{r}
+df_reuters %>% arrange(desc(score_sentimentr)) %>% head(n = 10)
+```
+
+
+```{r warnings = F}
+df_reuters %>% group_by(date) %>% 
+  summarize(n_articles = n(), avg_sentiment = mean(score_sentimentr)) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = avg_sentiment)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Average sentiment") +
+  ggtitle('Sentiment over time for Reuters headlines dataset, measured using SentimentR')
+```
+
+Dan NRC. Dit is een slechte metric volgens de validatieresultaten, dat zie je hier ook terug.
+
+```{r warnings = F}
+df_reuters %>% group_by(date) %>% 
+  summarize(n_articles = n(), avg_sentiment = mean(score_nrc)) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = avg_sentiment)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Average sentiment") +
+  ggtitle('Sentiment over time for Reuters headlines dataset, measured using NRC')
+```
+
+Dan Bing. 
+
+```{r warnings = F}
+df_reuters %>% group_by(date) %>% 
+  summarize(n_articles = n(), avg_sentiment = mean(score_bing)) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = avg_sentiment)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Average sentiment") +
+  ggtitle('Sentiment over time for Reuters headlines dataset, measured using Bing')
+```
+
+Dan Loughran. 
+
+```{r warnings = F}
+df_reuters %>% group_by(date) %>% 
+  summarize(n_articles = n(), avg_sentiment = mean(score_loughran)) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = avg_sentiment)) + geom_point() + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Average sentiment") +
+  ggtitle('Sentiment over time for Reuters headlines dataset, measured using Loughran')
+```
+
+We hebben sentiment gemeten op meerdere manieren. Eerst hebben we per methode de score berekend, maar daarna hebben we het artikel ook geclassificeerd op positief / negatief / neutraal. Laten we eens die classificatie gebruiken om te zien of dat andere grafieken oplevert.
+
+```{r}
+df_reuters %>% group_by(date, pred_sentimentr) %>%
+  summarize(n_articles = n()) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = n_articles, group = pred_sentimentr, col = pred_sentimentr)) + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Number of articles", color = "Sentiment") + 
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using SentimentR')
+```
+
+Zelfde voor Bing:
+
+```{r}
+df_reuters %>% group_by(date, pred_bing) %>%
+  summarize(n_articles = n()) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = n_articles, group = pred_bing, col = pred_bing)) + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Number of articles", color = "Sentiment") + 
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using Bing')
+```
+
+Zelfde voor NRC:
+
+Negative heeft hier bijna dezelfde trend dan neutral bij Bing -> ik gok dat er een of een paar woorden zijn die bij NRC op de andere lijst staan?
+
+```{r}
+df_reuters %>% group_by(date, pred_nrc) %>%
+  summarize(n_articles = n()) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = n_articles, group = pred_nrc, col = pred_nrc)) + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Number of articles", color = "Sentiment") + 
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using NRC')
+```
+
+Zelfde voor Loughran:
+
+```{r}
+df_reuters %>% group_by(date, pred_loughran) %>%
+  summarize(n_articles = n()) %>%
+  filter(date != as.Date("1969-12-31"), n_articles >= 15) %>%
+  ggplot(aes(x = date, y = n_articles, group = pred_loughran, col = pred_loughran)) + geom_smooth(level = 0.95) + 
+  scale_x_date(breaks = "1 year", date_labels = "%Y") + 
+  labs(x = "Date", y = "Number of articles", color = "Sentiment") + 
+  ggtitle('Sentiment over time for Kaggle headlines dataset, measured using Loughran')
+```
+
